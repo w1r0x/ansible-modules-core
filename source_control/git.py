@@ -290,25 +290,20 @@ def get_version(module, git_path, dest, ref="HEAD"):
     sha = stdout.rstrip('\n')
     return sha
 
-def get_submodule_versions(git_path, module, dest, version='HEAD'):
-    cmd = [git_path, 'submodule', 'foreach', git_path, 'rev-parse', version]
-    (rc, out, err) = module.run_command(cmd, cwd=dest)
-    if rc != 0:
-        module.fail_json(msg='Unable to determine hashes of submodules')
+def get_submodule_versions(git_path, module, dest, remote='', branches={}):
+    version = 'HEAD'
     submodules = {}
-    subm_name = None
-    for line in out.splitlines():
-        if line.startswith("Entering '"):
-            subm_name = line[10:-1]
-        elif len(line.strip()) == 40:
-            if subm_name is None:
-                module.fail_json()
-            submodules[subm_name] = line.strip()
-            subm_name = None
-        else:
-            module.fail_json(msg='Unable to parse submodule hash line: %s' % line.strip())
-    if subm_name is not None:
-        module.fail_json(msg='Unable to find hash for submodule: %s' % subm_name)
+    for subm in submodules_list(dest):
+      if subm in branches:
+          version = '%s/%s' % (remote, branches[subm])
+
+      cmd = [git_path, 'rev-parse', version]
+      (rc, out, err) = module.run_command(cmd, cwd=dest + '/' + subm)
+
+      if rc != 0:
+          module.fail_json(msg='Unable to determine hash of submodule: %s' % subm)
+
+      submodules[subm] = out.strip()
 
     return submodules
 
@@ -352,6 +347,8 @@ def has_local_mods(module, git_path, dest, bare):
     rc, stdout, stderr = module.run_command(cmd, cwd=dest)
     lines = stdout.splitlines()
     lines = filter(lambda c: not re.search('^\\?\\?.*$', c), lines)
+    submodules = submodules_list(dest)
+    lines = filter(lambda c: c.strip().split(' ',1)[1] not in submodules, lines)
 
     return len(lines) > 0
 
@@ -534,6 +531,9 @@ def submodules_fetch(git_path, module, remote, track_submodules, dest):
         # no submodules
         return changed
 
+    #branches list by submodule name
+    branches = {}
+
     gitmodules_file = open(os.path.join(dest, '.gitmodules'), 'r')
     for line in gitmodules_file:
         # Check for new submodules
@@ -552,6 +552,16 @@ def submodules_fetch(git_path, module, remote, track_submodules, dest):
             else:
                 add_git_host_key(module, repo, accept_hostkey=module.params['accept_hostkey'])
 
+        # collect submodule names
+        if line.strip().startswith('[submodule "'):
+            subm_name = line.strip()[12:-2]
+
+        # collect submodules branches
+        if line.strip().startswith('branch'):
+            branches[subm_name] = line.split('=', 1)[1].strip()
+        else:
+            branches[subm_name] = 'master'
+
     # Check for updates to existing modules
     if not changed:
         # Fetch updates
@@ -563,10 +573,7 @@ def submodules_fetch(git_path, module, remote, track_submodules, dest):
 
         if track_submodules:
             # Compare against submodule HEAD
-            ### FIXME: determine this from .gitmodules
-            version = 'master'
-            after = get_submodule_versions(git_path, module, dest, '%s/%s'
-                    % (remote, version))
+            after = get_submodule_versions(git_path, module, dest, remote, branches)
             if begin != after:
                 changed = True
         else:
@@ -601,6 +608,21 @@ def submodule_update(git_path, module, dest, track_submodules):
         module.fail_json(msg="Failed to init/update submodules: %s" % out + err)
     return (rc, out, err)
 
+
+def submodules_list(dest):
+    submodules = []
+
+    if not os.path.exists(os.path.join(dest, '.gitmodules')):
+        # no submodules
+        return submodules
+
+    gitmodules_file = open(os.path.join(dest, '.gitmodules'), 'r')
+    for line in gitmodules_file:
+        # collect submodule names
+        if line.strip().startswith('[submodule "'):
+            submodules.append(line.strip()[12:-2])
+
+    return submodules
 
 def switch_version(git_path, module, dest, remote, version, verify_commit):
     cmd = ''
@@ -722,6 +744,7 @@ def main():
     before = None
     local_mods = False
     repo_updated = None
+    submodules_updated = True
     if (dest and not os.path.exists(gitconfig)) or (not dest and not allow_clone):
         # if there is no git configuration, do a clone operation unless:
         # * the user requested no clone (they just want info)
@@ -753,7 +776,9 @@ def main():
         # exit if already at desired sha version
         set_remote_url(git_path, module, repo, dest, remote)
         remote_head = get_remote_head(git_path, module, dest, version, remote, bare)
-        if before == remote_head:
+        if recursive and not bare:
+            submodules_updated = submodules_fetch(git_path, module, remote, track_submodules, dest)
+        if (before == remote_head) and not submodules_updated:
             if local_mods:
                 module.exit_json(changed=True, before=before, after=remote_head,
                     msg="Local modifications exist")
@@ -777,10 +802,7 @@ def main():
         switch_version(git_path, module, dest, remote, version, verify_commit)
 
     # Deal with submodules
-    submodules_updated = False
     if recursive and not bare:
-        submodules_updated = submodules_fetch(git_path, module, remote, track_submodules, dest)
-
         if module.check_mode:
             if submodules_updated:
                 module.exit_json(changed=True, before=before, after=remote_head, submodules_changed=True)
